@@ -1,0 +1,18 @@
+# Sample only. Copy to ~/.config/containers/systemd/openpak-np-ubs.container.
+[Unit]
+Description=OpenPak np-ubs (PS3 Online Storage for save data)
+
+[Container]
+ContainerName=openpak-np-ubs
+Image=ghcr.io/openpak/np-ubs:latest
+AutoUpdate=registry
+Network=openpak
+EnvironmentFile=%h/openpak/deploy/np-ubs.env
+Environment=NP_HTTP_ADDR=:8536
+Volume=%h/openpak/deploy/ps3-keys:/run/ps3:ro
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
