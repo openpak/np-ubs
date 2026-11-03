@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/md5"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -56,8 +55,7 @@ type Service struct {
 	ResourceKey []byte
 	FQDN        string // ubstorage-fqdn in the discovery file
 	IconBase    string // origin for icon-url, e.g. http://ubs.np.community.playstation.net
-	Quota       int64  // bytes per account
-	SaveMax     int64  // bytes per save
+	SaveMax     int64  // bytes per save (the allowance itself is the saves service's)
 	Log         *slog.Logger
 }
 
@@ -228,16 +226,16 @@ func (s *Service) fail(c *call, err error) {
 
 // head renders the storage-info and folder blocks; extra goes inside the folder element.
 func (s *Service) head(c *call, folderAttrs, extra string) (string, error) {
-	used, err := s.Store.Usage(c.r.Context(), c.owner)
+	p, err := s.Store.List(c.r.Context(), c.owner, c.typ, 0, 1)
 	if err != nil {
 		return "", err
 	}
-	f, err := s.Store.Folder(c.r.Context(), c.owner, c.typ)
-	if err != nil {
-		return "", err
-	}
+	return s.headOf(c, p, folderAttrs, extra), nil
+}
+
+func (s *Service) headOf(c *call, p Page, folderAttrs, extra string) string {
 	return fmt.Sprintf(`<storage-info quotasize="%d" totalsize="%d"/><folder type="%s" total="%d" totalsize="%d" seq="%d"%s>%s</folder>`,
-		s.Quota, used, c.typ, f.Total, f.TotalSize, f.Seq, folderAttrs, extra), nil
+		p.Quota, p.Used, c.typ, p.Info.Total, p.Info.TotalSize, p.Info.Seq, folderAttrs, extra)
 }
 
 func (s *Service) record(sv Save) string {
@@ -273,21 +271,16 @@ func (s *Service) list(c *call) {
 	}
 	// The start base is not visible in the firmware: 1-based when ≥ 1, 0 = first entry too.
 	offset := max(start-1, 0)
-	saves, err := s.Store.List(c.r.Context(), c.owner, c.typ, offset, limit)
+	page, err := s.Store.List(c.r.Context(), c.owner, c.typ, offset, limit)
 	if err != nil {
 		s.fail(c, err)
 		return
 	}
 	var b strings.Builder
-	for _, sv := range saves {
+	for _, sv := range page.Saves {
 		b.WriteString(s.record(sv))
 	}
-	h, err := s.head(c, fmt.Sprintf(` start="%d" results="%d"`, start, len(saves)), b.String())
-	if err != nil {
-		s.fail(c, err)
-		return
-	}
-	reply(c.w, resultOK, h, 0, nil)
+	reply(c.w, resultOK, s.headOf(c, page, fmt.Sprintf(` start="%d" results="%d"`, start, len(page.Saves)), b.String()), 0, nil)
 }
 
 func (s *Service) set(c *call) {
@@ -314,27 +307,30 @@ func (s *Service) set(c *call) {
 		return
 	}
 	ctx := c.r.Context()
-	used, err := s.Store.Usage(ctx, c.owner)
-	if err != nil {
+	// A new name counts against the per-account cap; the allowance itself is checked by saves.
+	if _, err := s.Store.Get(ctx, c.owner, c.typ, name); errors.Is(err, ErrNotFound) {
+		p, err := s.Store.List(ctx, c.owner, c.typ, 0, 1)
+		if err != nil {
+			s.fail(c, err)
+			return
+		}
+		if p.PlatformCount >= MaxSaves {
+			reply(c.w, resultFull, "", 0, nil)
+			return
+		}
+	} else if err != nil {
 		s.fail(c, err)
 		return
 	}
-	old, err := s.Store.Get(ctx, c.owner, c.typ, name)
-	if err != nil && !errors.Is(err, ErrNotFound) {
-		s.fail(c, err)
-		return
-	}
-	if used-old.Length+dat.Length > s.Quota || err != nil && s.count(c) >= MaxSaves {
-		reply(c.w, resultFull, "", 0, nil)
-		return
-	}
-	var iconBytes []byte
 	sv := Save{Owner: c.owner, Folder: c.typ, Name: name, OwnerInfo: d.Info.OwnerInfo, Title: d.Info.Title, Subtitle: d.Info.Subtitle,
-		Details: d.Info.Details, Lock: d.Info.Lock, Size: d.Info.Size, Length: dat.Length, Date: time.Now().UTC()}
+		Details: d.Info.Details, Lock: d.Info.Lock, Size: d.Info.Size}
 	sv.Updated, _ = time.Parse(time.RFC3339Nano, strings.TrimSpace(d.Info.Updated))
 	if sv.Updated.IsZero() {
-		sv.Updated = sv.Date
+		sv.Updated = time.Now().UTC()
 	}
+	var iconBytes []byte
+	var iconLen int64
+	iconMD5 := ""
 	if icon != nil {
 		iconBytes = make([]byte, icon.Length)
 		if _, err := io.ReadFull(c.body, iconBytes); err != nil || !md5ok(icon.MD5, md5sum(iconBytes)) {
@@ -344,29 +340,20 @@ func (s *Service) set(c *call) {
 		if p, _ := c.body.Peek(len(sep)); string(p) == sep {
 			c.body.Discard(len(sep))
 		}
-		if len(iconBytes) > 0 {
-			var b [16]byte
-			rand.Read(b[:])
-			sv.IconID = hex.EncodeToString(b[:])
-		}
+		iconLen, iconMD5 = icon.Length, icon.MD5
 	}
-	h := md5.New()
-	errBadData := errors.New("data md5 mismatch")
-	err = s.Store.Put(ctx, sv, iconBytes, io.TeeReader(c.body, h), func() error {
-		if !md5ok(dat.MD5, h) {
-			return errBadData
-		}
-		return nil
-	}, s.Quota)
+	// The data streams straight through to saves; it never sits in memory here.
+	cr := &countReader{r: io.LimitReader(c.body, dat.Length)}
+	stored, err := s.Store.Put(ctx, sv, iconLen, dat.Length, iconMD5, dat.MD5, io.MultiReader(bytes.NewReader(iconBytes), cr))
 	switch {
-	case errors.Is(err, errBadData), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+	case errors.Is(err, ErrBadData), err != nil && cr.n < dat.Length:
 		reply(c.w, resultUnspecified, "", 0, nil)
 		return
 	case err != nil:
 		s.fail(c, err)
 		return
 	}
-	hd, err := s.head(c, "", s.record(sv))
+	hd, err := s.head(c, "", s.record(stored))
 	if err != nil {
 		s.fail(c, err)
 		return
@@ -374,15 +361,15 @@ func (s *Service) set(c *call) {
 	reply(c.w, resultOK, hd, 0, nil)
 }
 
-// count is the number of saves the caller holds across all folders.
-func (s *Service) count(c *call) int {
-	n := 0
-	for f := range folders {
-		if fi, err := s.Store.Folder(c.r.Context(), c.owner, f); err == nil {
-			n += fi.Total
-		}
-	}
-	return n
+type countReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func md5sum(b []byte) hash.Hash {
@@ -412,7 +399,16 @@ func (s *Service) get(c *call) {
 		return
 	}
 	reply(c.w, resultOK, hd, sv.Length, func(w io.Writer) error {
-		return s.Store.WriteData(c.r.Context(), c.owner, c.typ, name, w)
+		rc, _, err := s.Store.Open(c.r.Context(), c.owner, c.typ, name)
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		n, err := io.Copy(w, rc)
+		if err == nil && n != sv.Length {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
 	})
 }
 

@@ -8,7 +8,7 @@ GOWORK=off go run -mod=vendor .
 
 Needs:
 
-- PostgreSQL database `np_ubs` (tables are created at start).
+- The core `saves` service (v0.5.0 or later): `NP_SAVES_URL` (e.g. `http://openpak-saves:20020`) and `NP_SAVES_KEY` (its `SAVES_INTERNAL_KEY`). No database of its own.
 - `NP_UBS_RESOURCE_KEY`: the 20-byte discovery signing key, vsh `0x683fb8` XOR `0x7F` (resource key slot 9). Not in git.
 - `NP_TICKET_KEY` and the account core (`NP_CORE_ADDR`, `NP_CORE_KEY`), as for the other NP services.
 - np-account with `NP_UBS_URL=http://<np-ubs>:8536`: it forwards `/ubs/` and `/np/resource/ubstorage/` here and lifts its

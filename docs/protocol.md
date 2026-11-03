@@ -47,5 +47,14 @@ rejects the upload.
 
 ## Results
 
-`00` ok, `02` bad ticket, `07` internal, `1a` save over `NP_UBS_SAVE_MAX`, `4a` no such save, `5f` account storage full
+`00` ok, `02` bad ticket, `07` internal, `1a` save over `NP_UBS_SAVE_MAX`, `4a` no such save, `5f` account storage full (the saves allowance, shared across networks, or 1000 saves)
 (inferred: the save-data plugin special-cases it), `ff` malformed. Always HTTP 200 with `Content-Length`.
+
+## Storage
+
+None here. Each operation maps onto the core saves service (`docs/protocol.md` there, "Neutral blobs"), platform `ps3`, title = the
+folder `type`, name = the save directory: `get_save_data_info_list` is a paged list (page <= 50, `start` 1-based as RE'd),
+`set_save_data` streams the icon then the data (md5s checked by saves), `get_save_data` returns the data after the XML with
+`Sce-Np-Info-Length`, `delete_save_data` deletes, `notify_downloaded` reads the info. `quotasize`/`totalsize` are the account allowance
+and its use across all networks; `seq` is saves' folder revision. Everything that is not an index key (`title`, `subtitle`, `details`,
+`owner-info`, `lock`, `updated`, console `size`) travels as the blob's `meta` JSON.

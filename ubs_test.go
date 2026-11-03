@@ -8,18 +8,18 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"openpak/np-common/coreclient"
 	"openpak/np-common/fakecore"
@@ -35,7 +35,7 @@ type user struct {
 	jid string
 }
 
-func setup(t *testing.T, store Store, quota, saveMax int64) (*httptest.Server, map[string]user) {
+func setup(t *testing.T, store Store, saveMax int64) (*httptest.Server, map[string]user) {
 	const coreKey = "test-core-key-at-least-thirty-two-bytes"
 	fake := fakecore.New(coreKey)
 	fake.AddAccount(fakecore.Account{ID: "alice", DisplayName: "Alice", Country: "PT"})
@@ -62,7 +62,7 @@ func setup(t *testing.T, store Store, quota, saveMax int64) (*httptest.Server, m
 	}
 	mux := http.NewServeMux()
 	(&Service{Core: core, Tickets: signer, Store: store, ResourceKey: resourceKey, FQDN: "ubs.example", IconBase: "http://ubs.example",
-		Quota: quota, SaveMax: saveMax, Log: slog.Default()}).Register(mux)
+		SaveMax: saveMax, Log: slog.Default()}).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, users
@@ -136,8 +136,11 @@ func want(t *testing.T, r resp, subs ...string) {
 	}
 }
 
-func runScenario(t *testing.T, store Store) {
-	srv, users := setup(t, store, 1<<20, 1<<19)
+func TestScenario(t *testing.T) {
+	fake := newFakeSaves(1 << 20)
+	fs := httptest.NewServer(fake)
+	t.Cleanup(fs.Close)
+	srv, users := setup(t, NewSavesClient(fs.URL, fake.key), 1<<19)
 	alice, bob := users["alice"], users["bob"]
 
 	// Discovery: signed, names our host.
@@ -159,7 +162,7 @@ func runScenario(t *testing.T, store Store) {
 	icon := []byte("\x89PNG fake icon")
 	data := []byte("save\r\n\r\nbytes\x00\xff")
 	r := upload(t, srv, &alice, "BLUS30001-SLOT1", icon, data)
-	want(t, r, `result="00"`, `totalsize="`+strconv.Itoa(len(data))+`"`, `total="1"`, `seq="1"`, `<data name="BLUS30001-SLOT1">`,
+	want(t, r, `result="00"`, `totalsize="`+strconv.Itoa(len(data)+len(icon))+`"`, `total="1"`, `seq="1"`, `<data name="BLUS30001-SLOT1">`,
 		`<title>Game &amp; Co</title>`, `<icon-url>http://ubs.example/ubs/icon/`, `<date>`)
 
 	r = post(t, srv, "get_save_data_info_list", &alice, `<folder type="ps3" start="1" max="50"/>`)
@@ -220,36 +223,139 @@ func runScenario(t *testing.T, store Store) {
 	want(t, post(t, srv, "get_save_data", &alice, get), `result="4a"`)
 }
 
-func TestMemStore(t *testing.T) { runScenario(t, &MemStore{}) }
+// fakeSaves is the neutral blob surface of the core saves service, in memory, with the same
+// answers the real one gives (docs/protocol.md there).
+type fakeSaves struct {
+	key       string
+	allowance int64
+	mu        sync.Mutex
+	blobs     map[string]*fakeBlob // account/folder/name
+	seq       map[string]int64
+}
 
-func TestPGStore(t *testing.T) {
-	dbURL := os.Getenv("NP_UBS_TEST_DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("NP_UBS_TEST_DATABASE_URL not set")
-	}
-	pool, err := pgxpool.New(context.Background(), dbURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if _, err := pool.Exec(context.Background(), `DROP TABLE IF EXISTS ubs_chunks, ubs_saves, ubs_folders`); err != nil {
-		t.Fatal(err)
-	}
-	s := &PGStore{DB: pool}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	runScenario(t, s)
+type fakeBlob struct {
+	icon, data []byte
+	iconID     string
+	meta       map[string]any
+	date       time.Time
+}
 
-	// Multi-chunk round trip.
-	big := make([]byte, chunkSize*2+123)
-	rand.Read(big)
-	sv := Save{Owner: "z", Folder: "ps3", Name: "BIG", Length: int64(len(big)), Date: time.Now(), Updated: time.Now()}
-	if err := s.Put(context.Background(), sv, nil, bytes.NewReader(big), func() error { return nil }, 1<<30); err != nil {
-		t.Fatal(err)
+func newFakeSaves(allowance int64) *fakeSaves {
+	return &fakeSaves{key: "saves-key", allowance: allowance, blobs: map[string]*fakeBlob{}, seq: map[string]int64{}}
+}
+
+func (b *fakeBlob) json(name string, seq int64) map[string]any {
+	return map[string]any{"name": name, "size": len(b.data), "icon_size": len(b.icon), "icon_id": b.iconID, "date": b.date, "meta": b.meta, "seq": seq}
+}
+
+func (f *fakeSaves) used(acct string) (n int64) {
+	for k, b := range f.blobs {
+		if strings.HasPrefix(k, acct+"/") {
+			n += int64(len(b.icon) + len(b.data))
+		}
 	}
-	var out bytes.Buffer
-	if err := s.WriteData(context.Background(), "z", "ps3", "BIG", &out); err != nil || !bytes.Equal(out.Bytes(), big) {
-		t.Fatal("chunked round trip", err, out.Len())
+	return
+}
+
+func (f *fakeSaves) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Header.Get("X-Internal-Key") != f.key {
+		http.Error(w, "key", 401)
+		return
+	}
+	out := func(code int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(v)
+	}
+	p := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(p) == 4 && p[0] == "internal" && p[1] == "blobs" && p[2] == "icons" {
+		for _, b := range f.blobs {
+			if b.iconID == p[3] {
+				w.Write(b.icon)
+				return
+			}
+		}
+		out(404, nil)
+		return
+	}
+	// internal/accounts/{acct}/blobs/ps3/{folder}[/{name}[/info]]
+	if len(p) < 6 || p[3] != "blobs" || p[4] != "ps3" {
+		out(400, nil)
+		return
+	}
+	acct, folder := p[2], p[5]
+	sk := acct + "/" + folder
+	if len(p) == 6 {
+		q := r.URL.Query()
+		off, _ := strconv.Atoi(q.Get("offset"))
+		lim, _ := strconv.Atoi(q.Get("limit"))
+		var names []string
+		var size int64
+		count := 0
+		for k, b := range f.blobs {
+			if strings.HasPrefix(k, acct+"/") {
+				count++
+			}
+			if strings.HasPrefix(k, sk+"/") {
+				names = append(names, strings.TrimPrefix(k, sk+"/"))
+				size += int64(len(b.icon) + len(b.data))
+			}
+		}
+		sort.Strings(names)
+		items := []any{}
+		for i := off; i < len(names) && i < off+lim; i++ {
+			items = append(items, f.blobs[sk+"/"+names[i]].json(names[i], 0))
+		}
+		out(200, map[string]any{"items": items, "total": len(names), "total_size": size, "seq": f.seq[sk], "platform_count": count,
+			"usage": map[string]any{"allowance_used": f.used(acct), "allowance": f.allowance}})
+		return
+	}
+	name, key := p[6], sk+"/"+p[6]
+	cur := f.blobs[key]
+	switch {
+	case r.Method == "PUT":
+		il, _ := strconv.ParseInt(r.Header.Get("X-Icon-Length"), 10, 64)
+		body, _ := io.ReadAll(r.Body)
+		if int64(len(body)) != r.ContentLength || il > r.ContentLength {
+			out(422, nil)
+			return
+		}
+		icon, data := body[:il], body[il:]
+		if m := r.Header.Get("X-Data-Md5"); m != "" && m != md5hex(data) {
+			out(422, nil)
+			return
+		}
+		old := int64(0)
+		if cur != nil {
+			old = int64(len(cur.icon) + len(cur.data))
+		}
+		if f.used(acct)-old+int64(len(body)) > f.allowance {
+			out(507, map[string]any{"error": "quota_exceeded"})
+			return
+		}
+		raw, _ := base64.StdEncoding.DecodeString(r.Header.Get("X-Meta"))
+		b := &fakeBlob{icon: icon, data: data, date: time.Now().UTC()}
+		json.Unmarshal(raw, &b.meta)
+		if il > 0 {
+			b.iconID = md5hex([]byte(key + b.date.String()))
+		}
+		f.blobs[key] = b
+		f.seq[sk]++
+		out(200, b.json(name, f.seq[sk]))
+	case cur == nil:
+		out(404, nil)
+	case r.Method == "DELETE":
+		delete(f.blobs, key)
+		f.seq[sk]++
+		out(200, map[string]any{"deleted": true})
+	case len(p) == 8:
+		out(200, cur.json(name, f.seq[sk]))
+	default:
+		raw, _ := json.Marshal(cur.json(name, f.seq[sk]))
+		w.Header().Set("X-Blob-Info", base64.StdEncoding.EncodeToString(raw))
+		w.Write(cur.data)
 	}
 }
+

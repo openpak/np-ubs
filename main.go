@@ -15,8 +15,6 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -40,9 +38,9 @@ func envBytes(key string, def int64) (int64, error) {
 
 func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	dbURL := os.Getenv("NP_UBS_DATABASE_URL")
-	if dbURL == "" {
-		return fmt.Errorf("NP_UBS_DATABASE_URL must be set")
+	savesURL, savesKey := os.Getenv("NP_SAVES_URL"), os.Getenv("NP_SAVES_KEY")
+	if savesURL == "" || savesKey == "" {
+		return fmt.Errorf("NP_SAVES_URL and NP_SAVES_KEY must be set (the core saves service)")
 	}
 	if len(os.Getenv("NP_CORE_KEY")) < 32 {
 		return fmt.Errorf("NP_CORE_KEY must be at least 32 bytes")
@@ -51,25 +49,12 @@ func run() error {
 	if err != nil || len(resourceKey) != 20 {
 		return fmt.Errorf("NP_UBS_RESOURCE_KEY must name a 20-byte key file")
 	}
-	quota, err := envBytes("NP_UBS_ACCOUNT_QUOTA", 1<<30)
-	if err != nil {
-		return err
-	}
 	saveMax, err := envBytes("NP_UBS_SAVE_MAX", 1<<30)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	pool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		return err
-	}
-	defer pool.Close()
-	store := &PGStore{DB: pool}
-	if err := store.Migrate(ctx); err != nil {
-		return err
-	}
 	core, err := coreclient.Dial(nphttp.Env("NP_CORE_ADDR", "localhost:7000"), os.Getenv("NP_CORE_KEY"))
 	if err != nil {
 		return err
@@ -80,8 +65,8 @@ func run() error {
 		return err
 	}
 	fqdn := nphttp.Env("NP_UBS_FQDN", "ubs.np.community.playstation.net")
-	svc := &Service{Core: core, Tickets: signer, Store: store, ResourceKey: resourceKey, FQDN: fqdn,
-		IconBase: nphttp.Env("NP_UBS_ICON_BASE", "http://"+fqdn), Quota: quota, SaveMax: saveMax, Log: log}
+	svc := &Service{Core: core, Tickets: signer, Store: NewSavesClient(savesURL, savesKey), ResourceKey: resourceKey, FQDN: fqdn,
+		IconBase: nphttp.Env("NP_UBS_ICON_BASE", "http://"+fqdn), SaveMax: saveMax, Log: log}
 	mux := http.NewServeMux()
 	svc.Register(mux)
 	nphttp.Health(mux)
